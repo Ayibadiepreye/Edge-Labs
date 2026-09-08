@@ -1,0 +1,48 @@
+{
+  "session_summary": {
+    "start_time_utc": "2026-09-06T19:23:09.549153+00:00",
+    "end_time_utc": "2026-09-06T19:23:38.127922+00:00",
+    "total_uptime_formatted": "00h 00m 28s",
+    "total_uptime_seconds": 28.58,
+    "streaming_uptime_formatted": "00h 00m 08s",
+    "streaming_uptime_seconds": 8.37,
+    "termination_reason": "TICK_STALL_EXCEEDED_5_MINUTES"
+  },
+  "quote_throughput": {
+    "total_ticks_received": 271,
+    "average_ticks_per_second": 32.36,
+    "last_price": 4430.14,
+    "last_spread": 0.08,
+    "last_bar_timestamp": 1788555598
+  },
+  "latency_and_performance": {
+    "average_memory_eval_latency_ms": 4.173,
+    "p95_memory_eval_latency_ms": 6.998,
+    "throttle_spike_count": 0,
+    "throttle_events": []
+  },
+  "stall_telemetry": {
+    "stall_warning_count": 1,
+    "stall_warnings": [
+      {
+        "timestamp": 1788722614.78346,
+        "stall_duration_sec": 5.0,
+        "bar_ts": 1788555598,
+        "uptime_sec": 25.2
+      }
+    ]
+  },
+  "deep_diagnostics": {
+    "timestamp": "2026-09-06T19:23:37.790088+00:00",
+    "current_url": "https://demo.tradelocker.com/en/trade?instrument=4749",
+    "page_title": "XAUUSD 4,430.01",
+    "is_online": true,
+    "cloudflare_detected": false,
+    "auth_redirect_detected": false,
+    "tradingview_widget_mounted": true,
+    "error_modals_detected": [],
+    "root_cause_analysis": "MARKET_CLOSED_WEEKEND: Spot Gold (XAUUSD) market is currently closed for the weekend. Chart and DOM are healthy and mounted, but broker price feed is dormant until market open (Sunday 5:00 PM EST / 21:00 UTC).",
+    "screenshot_path": "C:\\Users\\Setons\\.gemini\\antigravity\\scratch\\edge_labs_bot\\screenshots\\streamer_stall_diagnostic_20260906_192337.png",
+    "html_dump_path": "C:\\Users\\Setons\\.gemini\\antigravity\\scratch\\edge_labs_bot\\logs\\streamer_stall_dump_20260906_192337.html"
+  }
+}

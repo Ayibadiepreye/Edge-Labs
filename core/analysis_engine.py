@@ -10,6 +10,7 @@ All computations are pure NumPy/Pandas — fast, in-memory.
 from __future__ import annotations
 import numpy as np
 import time
+from collections import deque
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
@@ -75,6 +76,17 @@ class AnalysisSnapshot:
     reversal:  ReversalResult
     structure: StructureLevels
     spread:    float = 0.0
+    tick_noise: float = 0.06
+    adverse_noise_dist: float = 0.05
+    adverse_noise_vel: float = 0.02
+    is_sweetspot_ignition: bool = False
+    sweetspot_min: float = 0.10
+    sweetspot_max: float = 0.55
+    directional_displacement: float = 0.0
+    opening_window_cleared: bool = True
+    wick_established: bool = True
+    counter_noise_ok: bool = True
+    sample_size_used: int = 3
     ready_to_simulate: bool = False
     impulse_side: str = 'buy'
 
@@ -94,6 +106,21 @@ def _candle_lower_wick(candle: dict) -> float:
 
 def _is_green(candle: dict) -> bool:
     return candle['c'] >= candle['o']
+
+def _calculate_ignition_sweetspot(completed_candles: list[dict], n_lookback: int = 10) -> tuple[float, float]:
+    """Analyzes recent completed candles to determine the historical breakout ignition sweet-spot:
+    - min_ignition: Minimum displacement needed to confirm directional commitment and avoid color flips (e.g. 15-20% of avg body).
+    - max_ignition: Maximum allowable displacement before the candle is considered extended / chasing (e.g. 40-45% of avg body).
+    """
+    if not completed_candles:
+        return 0.10, 0.55
+    window = completed_candles[-n_lookback:]
+    bodies = [_candle_body(c) for c in window if _candle_body(c) > 0.10]
+    avg_body = float(np.mean(bodies)) if bodies else 1.00
+
+    min_ignition = max(0.10, round(avg_body * 0.18, 2))
+    max_ignition = max(0.35, round(avg_body * 0.42, 2))
+    return min_ignition, max_ignition
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -375,11 +402,93 @@ def analyse_structure(
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AnalysisEngine:
-    """Runs all 5 analysis modules and returns a unified snapshot."""
+    """Runs all 5 analysis modules and returns a unified snapshot with dynamic in-memory candle lifecycle calibration."""
 
     def __init__(self):
         self._prev_speed: Optional[str] = None
         self._prev_snapshot: Optional[AnalysisSnapshot] = None
+        self._candle_lifecycle_memory: deque = deque(maxlen=50)  # In-memory completed candle lifecycle database
+        self._active_candle_t: Optional[int] = None
+        self._active_pre_breakout_dip: float = 0.0
+        self._active_expansion: float = 0.0
+
+    def _update_candle_lifecycle_memory(self, forming_candle: Optional[dict]):
+        """Tracks the active forming candle's entire journey from open to completion in RAM."""
+        if forming_candle:
+            c_t = forming_candle.get('t')
+            open_p = forming_candle.get('o', 0.0)
+            high_p = forming_candle.get('h', 0.0)
+            low_p = forming_candle.get('l', 0.0)
+            curr_c = forming_candle.get('c', 0.0)
+
+            # If brand new candle started, archive the completed profile
+            if self._active_candle_t is not None and self._active_candle_t != c_t:
+                profile = {
+                    'pre_breakout_dip': round(self._active_pre_breakout_dip, 3),
+                    'expansion': round(self._active_expansion, 3),
+                    'body': round(abs(curr_c - open_p), 3) if open_p > 0 else 0.0,
+                }
+                self._candle_lifecycle_memory.append(profile)
+                self._active_pre_breakout_dip = 0.0
+                self._active_expansion = 0.0
+
+            self._active_candle_t = c_t
+            if open_p > 0:
+                is_green = (curr_c >= open_p)
+                if is_green:
+                    dip = max(0.0, open_p - low_p)
+                    push = max(0.0, high_p - open_p)
+                else:
+                    dip = max(0.0, high_p - open_p)
+                    push = max(0.0, open_p - low_p)
+
+                self._active_pre_breakout_dip = max(self._active_pre_breakout_dip, dip)
+                self._active_expansion = max(self._active_expansion, push)
+
+    def _determine_dynamic_sample_size(self, completed_candles: list[dict]) -> int:
+        """Dynamically adjusts the number of in-memory candle profiles to analyze:
+        - Frequent directional flips or chop: Expands to 5-8 candles for statistical confirmation.
+        - Clean, consistent trend: Focuses on the last 2-3 candles for instant, responsive calibration.
+        """
+        if not completed_candles or len(completed_candles) < 3:
+            return max(2, min(5, len(self._candle_lifecycle_memory)))
+
+        recent = completed_candles[-6:]
+        colors = [_is_green(c) for c in recent]
+        flips = sum(1 for i in range(1, len(colors)) if colors[i] != colors[i-1])
+
+        if flips >= 3:
+            return min(len(self._candle_lifecycle_memory), 8) if len(self._candle_lifecycle_memory) > 0 else 5
+        elif flips == 0:
+            return 2
+        else:
+            return 4
+
+    def get_dynamic_sweetspot_window(self, completed_candles: list[dict], orderflow_delta: Optional[dict] = None) -> tuple[float, float, int]:
+        """Dynamically computes the non-reversing sweet-spot entry threshold from in-memory observed candle lifecycles,
+        with dynamic sample sizing and high-conviction bypass."""
+        sample_size = self._determine_dynamic_sample_size(completed_candles)
+        
+        # Strong signal bypass (Explosive delta >= 0.45): tighter sample size for immediate capture
+        if orderflow_delta and isinstance(orderflow_delta, dict) and abs(orderflow_delta.get('delta_ratio', 0.0)) >= 0.45:
+            sample_size = 2
+
+        if len(self._candle_lifecycle_memory) >= 2:
+            subset = list(self._candle_lifecycle_memory)[-sample_size:]
+            dips = [p['pre_breakout_dip'] for p in subset if p['pre_breakout_dip'] > 0.02]
+            expansions = [p['expansion'] for p in subset if p['expansion'] > 0.10]
+            avg_dip = float(np.median(dips)) if dips else 0.12
+            avg_exp = float(np.mean(expansions)) if expansions else 1.00
+
+            min_sweetspot = max(0.10, min(0.20, round(avg_dip * 1.30, 2)))  # Clears opposing pullback vibration (10¢-20¢)
+            max_sweetspot = max(0.35, min(0.65, round(avg_exp * 0.42, 2)))  # Prevents late top-buying (35¢-65¢)
+            return min_sweetspot, max_sweetspot, sample_size
+        elif self._active_pre_breakout_dip > 0.02:
+            min_sweetspot = max(0.10, min(0.20, round(self._active_pre_breakout_dip * 1.30, 2)))
+            max_sweetspot = max(0.35, min(0.65, round(max(0.80, self._active_expansion) * 0.40, 2)))
+            return min_sweetspot, max_sweetspot, 1
+        else:
+            return 0.12, 0.50, 1
 
     def analyse(
         self,
@@ -391,8 +500,12 @@ class AnalysisEngine:
         spread: float,
         recent_ticks: Optional[list] = None,
         orderflow_delta: Optional[dict] = None,
+        tick_noise: Any = 0.06,
     ) -> AnalysisSnapshot:
         """Run full 5-D analysis pipeline per Section 4."""
+        # 0. In-Memory Candle Lifecycle Profiling
+        self._update_candle_lifecycle_memory(forming_candle)
+
         # 4.1 Direction
         direction = analyse_direction(completed_candles, forming_candle)
 
@@ -432,23 +545,61 @@ class AnalysisEngine:
             else:
                 delta_ok = (d_ratio <= -0.40) # Strong net sell imbalance
 
-        # 2. Dynamic Momentum Ignition & Breakout Trigger
+        # Directional Displacement Calculation (Eliminates opposing opening wick traps)
+        if ref_candle:
+            c_open = ref_candle.get('o', current_price)
+            c_close = ref_candle.get('c', current_price)
+            c_high = ref_candle.get('h', current_price)
+            c_low = ref_candle.get('l', current_price)
+            c_ts = ref_candle.get('t', 0)
+            
+            # Elapsed seconds in the current M5 candle
+            now_ms = time.time() * 1000
+            elapsed_sec = max(0.0, (now_ms - c_ts) / 1000.0) if c_ts > 0 else 999.0
+            
+            if impulse_side == 'buy':
+                directional_disp = round(c_close - c_open, 2)
+                is_correct_color = (directional_disp > 0)
+                wick_established = bool(c_low < (c_open - 0.02) or elapsed_sec >= 20.0)
+            else:
+                directional_disp = round(c_open - c_close, 2)
+                is_correct_color = (directional_disp > 0)
+                wick_established = bool(c_high > (c_open + 0.02) or elapsed_sec >= 20.0)
+        else:
+            directional_disp = 0.0
+            is_correct_color = False
+            wick_established = True
+            elapsed_sec = 999.0
+
+        # 2. Dynamic Momentum Ignition & Breakout Trigger (Requires >= 12¢ Directional Expansion)
         breakout_ok = False
         if completed_candles and len(completed_candles) >= 1:
             prev_c = completed_candles[-1]
-            if impulse_side == 'buy' and (current_price >= (prev_c['h'] - 0.05) or _candle_body(ref_candle) >= 0.12):
+            if impulse_side == 'buy' and (current_price >= (prev_c['h'] - 0.05) or directional_disp >= 0.12):
                 breakout_ok = True
-            elif impulse_side == 'sell' and (current_price <= (prev_c['l'] + 0.05) or _candle_body(ref_candle) >= 0.12):
+            elif impulse_side == 'sell' and (current_price <= (prev_c['l'] + 0.05) or directional_disp >= 0.12):
                 breakout_ok = True
         else:
-            breakout_ok = True
+            breakout_ok = bool(directional_disp >= 0.12)
 
-        # 3. Ground-Floor Early Ignition Window (0.05 to 0.60 — strictly enters at the root of the move)
-        ref_body = _candle_body(ref_candle) if ref_candle else 0.0
-        is_early_ignition = (0.05 <= ref_body <= 0.60)
+        # 3. Dynamic Sweet-Spot Ignition Window (Directional Expansion)
+        min_ign, max_ign, sample_size = self.get_dynamic_sweetspot_window(completed_candles, orderflow_delta)
+        is_early_ignition = bool(is_correct_color and (min_ign <= directional_disp <= max_ign))
         direction_ok = (direction.bias != 'mixed')
+        
+        # 4. Opening 20-Second Wick Probe Protection (Allows analysis every tick, blocks premature execution unless extreme surge)
+        is_extreme_surge = bool(orderflow_delta and abs(orderflow_delta.get('delta_ratio', 0.0)) >= 0.50 and speed.price_velocity >= 0.30 and directional_disp >= 0.15)
+        opening_window_cleared = bool((elapsed_sec >= 20.0) or is_extreme_surge)
 
-        # 4. Net Directional Tick Flow Stream Confirmation
+        # Parse real-time opposing counter-trend adverse noise
+        if isinstance(tick_noise, dict):
+            noise_dist = tick_noise.get('adverse_distance', 0.05)
+            noise_vel = tick_noise.get('adverse_velocity', 0.02)
+        else:
+            noise_dist = float(tick_noise) if tick_noise else 0.05
+            noise_vel = 0.02
+
+        # 5. Net Directional Tick Flow Stream Confirmation
         flow_ok = True
         if recent_ticks and len(recent_ticks) >= 3:
             net_tick_move = (recent_ticks[-1]['bid'] - recent_ticks[0]['bid'])
@@ -457,14 +608,14 @@ class AnalysisEngine:
             else:
                 flow_ok = (net_tick_move <= 0.01)   # No immediate hard pop against the short
 
-        # 5. Spread Gate: Only execute when spread is compressed (<= 8¢) so TP distance stays short and fast
+        # 6. Spread Gate: Only execute when spread is compressed (<= 8¢) so TP distance stays short and fast
         spread_val = spread if spread < 5 else spread / 100.0
         spread_ok = (spread_val <= 0.08)
 
-        # 6. Rejection & Clean Airflow Check (Wick Drag < 18% for clean frictionless runway)
+        # 7. Rejection & Clean Airflow Check (Wick Drag < 18% for clean frictionless runway)
         rejection_ok = (rejection.upper_ratio < 0.18 if impulse_side == 'buy' else rejection.lower_ratio < 0.18)
         
-        # 7. Directional absorption defense: block BUY on upper absorption, block SELL on lower absorption
+        # 8. Directional absorption defense: block BUY on upper absorption, block SELL on lower absorption
         if impulse_side == 'buy' and ('absorption_upper' in reversal.signs or 'over_expanded' in reversal.signs):
             reversal_ok = False
         elif impulse_side == 'sell' and ('absorption_lower' in reversal.signs or 'over_expanded' in reversal.signs):
@@ -472,7 +623,7 @@ class AnalysisEngine:
         else:
             reversal_ok = not reversal.has_reversal
 
-        # 8. Structure Clearance: Ensure price has open space before nearest S/R
+        # 9. Structure Clearance: Ensure price has open space before nearest S/R
         min_structure_room = 1.50
         if impulse_side == 'buy' and structure.nearest_resistance is not None:
             structure_ok = (structure.nearest_resistance - current_price) >= min_structure_room
@@ -481,11 +632,11 @@ class AnalysisEngine:
         else:
             structure_ok = True
 
-        # 9. Explosive Kinetic Expansion Capacity (Strictly reject stagnant / ranging candles)
+        # 10. Explosive Kinetic Expansion Capacity (Strictly reject stagnant / ranging candles)
         speed_ok = (speed.price_velocity >= 0.12 or speed.tick_velocity >= 25.0)
         not_stagnant = (speed.avg_body_size >= 0.90 or speed.classification in ['medium', 'fast'])
 
-        # 10. Circadian Session Gating & High-Conviction Institutional Delta Filter
+        # 11. Circadian Session Gating & High-Conviction Institutional Delta Filter
         # Strict delta conviction (Delta Ratio >= 0.38 on Buy, <= -0.38 on Sell) ensures smart money aggression
         utc_hour = datetime.now(timezone.utc).hour
         is_expansion_session = (7 <= utc_hour <= 17)
@@ -497,7 +648,7 @@ class AnalysisEngine:
             else:
                 delta_ok = (d_ratio <= -required_delta)
 
-        # 11. Preceding Candle Absorption Barrier (Prevents buying directly into trapped overhead limit walls)
+        # 12. Preceding Candle Absorption Barrier (Prevents buying directly into trapped overhead limit walls)
         prior_wick_ok = True
         if completed_candles and len(completed_candles) >= 1:
             prior_c = completed_candles[-1]
@@ -509,15 +660,14 @@ class AnalysisEngine:
                 p_lower_wick = (min(prior_c['o'], prior_c['c']) - prior_c['l']) / p_range
                 prior_wick_ok = (p_lower_wick <= 0.35)
 
-        # 12. 3-Candle Exhaustion / Over-Extension Guard (Prevents buying at the climax of a 3-candle run)
+        # 13. 3-Candle Exhaustion / Over-Extension Guard (Prevents buying at the climax of a 3-candle run)
         exhaustion_ok = True
         if completed_candles and len(completed_candles) >= 3:
             cum_disp = abs(completed_candles[-1]['c'] - completed_candles[-3]['o'])
             if cum_disp >= 6.00:
                 exhaustion_ok = False  # Fatigue detected: wait for fresh pause
 
-        # 13. Dynamic Anti-Chop Quality Index & Velocity Override (Protects Track A, B, and C)
-        # Calculates body-to-range quality across the last 5 candles; speed >= 0.12 overrides past chop
+        # 14. Dynamic Anti-Chop Quality Index & Velocity Override (Protects Track A, B, and C)
         if completed_candles and len(completed_candles) >= 3:
             recent_5 = completed_candles[-5:]
             tot_bodies = sum(_candle_body(c) for c in recent_5)
@@ -529,9 +679,12 @@ class AnalysisEngine:
 
         expansion_capacity_ok = dynamic_chop_clean or (speed.price_velocity >= 0.12 or speed.tick_velocity >= 25.0)
 
+        # Counter-Noise Excursion Gate (Protects against deep opposing wicks & adverse velocity in analysis)
+        counter_noise_ok = (noise_dist <= 0.12 and noise_vel <= 0.60)
+
         ready = (spread_ok and direction_ok and breakout_ok and delta_ok and not_stagnant and expansion_capacity_ok and
-                 is_early_ignition and rejection_ok and reversal_ok and structure_ok and flow_ok and speed_ok and
-                 prior_wick_ok and exhaustion_ok)
+                 is_early_ignition and opening_window_cleared and counter_noise_ok and rejection_ok and reversal_ok and
+                 structure_ok and flow_ok and speed_ok and prior_wick_ok and exhaustion_ok)
 
         snap = AnalysisSnapshot(
             timestamp=time.time(),
@@ -541,6 +694,17 @@ class AnalysisEngine:
             reversal=reversal,
             structure=structure,
             spread=round(spread, 2),
+            tick_noise=round(noise_dist, 3),
+            adverse_noise_dist=round(noise_dist, 3),
+            adverse_noise_vel=round(noise_vel, 3),
+            is_sweetspot_ignition=is_early_ignition,
+            sweetspot_min=round(min_ign, 2),
+            sweetspot_max=round(max_ign, 2),
+            directional_displacement=round(directional_disp, 2),
+            opening_window_cleared=opening_window_cleared,
+            wick_established=wick_established,
+            counter_noise_ok=counter_noise_ok,
+            sample_size_used=sample_size,
             ready_to_simulate=ready,
             impulse_side=impulse_side,
         )

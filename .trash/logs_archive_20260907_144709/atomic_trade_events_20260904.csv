@@ -1,0 +1,1 @@
+timestamp_utc,epoch_ts,event_type,order_id,position_id,track_id,side,qty_lots,trigger_price,fill_price,exit_price,slippage_cents,initial_sl,active_sl,tp_price,market_spread_cents,tick_vel_at_event,trade_duration_sec,ticks_during_trade,gross_pnl,broker_fee,net_pnl,balance,loss_floor_buffer,reason

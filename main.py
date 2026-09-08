@@ -26,6 +26,7 @@ tl_api_log.setLevel(logging.CRITICAL + 10)
 tl_api_log.propagate = False
 logging.getLogger().setLevel(logging.WARNING)
 warnings.filterwarnings('ignore')
+logger = logging.getLogger("system")
 
 # Set Windows App ID for taskbar icon
 if sys.platform == 'win32':
@@ -49,8 +50,12 @@ from PyQt6.QtGui import QColor, QPainter, QFont, QIcon
 
 from core.api_client     import EdgeLabsClient
 from core.candle_builder import CandleBuilder
-from core.analysis_engine import AnalysisEngine
+from core.multi_tf_analysis_engine import MultiTFAnalysisEngine, MultiTFTradeCoordinator
 from core.execution_engine import ExecutionEngine
+from core.multi_account_manager import MultiAccountManager
+from core.telemetry_poller import TelemetryPoller
+from core.web_server import MobileWebServer
+from core.live_telemetry_logger import LiveTelemetryLogger
 from ui.chart_window     import MainChartWindow, BotSignals
 import config
 
@@ -399,7 +404,7 @@ class SplashScreen(QWidget):
 class BootWorker(QThread):
     status      = pyqtSignal(str, bool)
     progress    = pyqtSignal(int, int)
-    finished_ok = pyqtSignal(object, object, object, object)
+    finished_ok = pyqtSignal(object, object, object, object, object, object, object, object)
     failed      = pyqtSignal(str)
 
     def run(self):
@@ -408,6 +413,32 @@ class BootWorker(QThread):
             client = EdgeLabsClient()
             self.status.emit(
                 f"[+] Connected to TradeLocker  |  XAUUSD ID={client.instrument_id} (Contract: {client.contract_size} oz)", True)
+
+            # Discover and authenticate all accounts in memory
+            acc_mgr = MultiAccountManager()
+            self.status.emit(f"[*] Discovering {len(acc_mgr.accounts)} accounts from .env...", True)
+            auth_res = acc_mgr.authenticate_all()
+            ok_cnt = sum(1 for v in auth_res.values() if v)
+            self.status.emit(f"[+] {ok_cnt}/{len(acc_mgr.accounts)} Accounts Authenticated & Armed", True)
+
+            telemetry_poller = TelemetryPoller(acc_mgr)
+            telemetry_poller.start()
+
+            # Start Mobile PWA Web Server on port 8899 (for local & Tailscale remote control)
+            mobile_web = MobileWebServer(acc_mgr, port=config.WEB_SERVER_PORT)
+            mobile_web.start()
+            self.status.emit(f"[+] Mobile PWA Control Center Online at port {config.WEB_SERVER_PORT} (Tailscale ready)", True)
+
+            # Wait for Persistent Browser Price Streamer to be 100% Active & Streaming
+            if hasattr(client, 'browser_streamer') and client.browser_streamer:
+                self.status.emit("[*] Initializing Persistent Live Price Streamer (Chromium XAUUSD)...", True)
+                t_wait_start = time.time()
+                while time.time() - t_wait_start < 35.0:
+                    latest = client.browser_streamer.get_latest_price()
+                    if latest and latest.get('bid', 0) > 1000.0:
+                        self.status.emit(f"[+] Persistent Live Stream Active (Bid: ${latest['bid']:.2f} | Ask: ${latest['ask']:.2f})", True)
+                        break
+                    time.sleep(0.5)
 
             self.status.emit("[*] Fetching initial live quote...", True)
             price = client.get_live_price()
@@ -447,12 +478,13 @@ class BootWorker(QThread):
                     'v': int(forming.get('v', 1)),
                 }
 
-            engine = AnalysisEngine()
-            exec_engine = ExecutionEngine(client, demo_mode=True)
-            self.status.emit("[+] 5-D Analysis & Microsecond Execution Engines Online", True)
+            exec_engine = ExecutionEngine(client, account_manager=acc_mgr)
+            engine = MultiTFAnalysisEngine(spread_max=0.10, min_1s_velocity=20.0)
+            coordinator = MultiTFTradeCoordinator(virtual_broker=exec_engine.virtual_broker, margin_cap=4590.00, account_manager=acc_mgr)
+            self.status.emit("[+] 5-D Analysis & Multi-Account Execution Engines Online", True)
 
             time.sleep(0.4)
-            self.finished_ok.emit(client, builder, engine, exec_engine)
+            self.finished_ok.emit(client, builder, engine, exec_engine, coordinator, acc_mgr, telemetry_poller, mobile_web)
 
         except Exception as e:
             self.failed.emit(str(e))
@@ -464,19 +496,40 @@ class BootWorker(QThread):
 
 class BotWorker(QThread):
     def __init__(self, client: EdgeLabsClient, builder: CandleBuilder,
-                 engine: AnalysisEngine, exec_engine: ExecutionEngine,
+                 engine: MultiTFAnalysisEngine, exec_engine: ExecutionEngine,
+                 coordinator: MultiTFTradeCoordinator,
                  signals: BotSignals):
         super().__init__()
         self.client      = client
         self.builder     = builder
         self.engine      = engine
         self.exec_engine = exec_engine
+        self.coordinator = coordinator
         self.signals     = signals
+        self.telemetry_logger = LiveTelemetryLogger()
         self._running    = True
         self._tick_n     = 0
 
         # Auto-commit full candle history to chart UI whenever an M5 candle closes
         self.builder.on_candle_close(lambda c: self.signals.history_ready.emit(self.builder.get_all_candles()))
+
+        # Connect automatic history re-seeder when browser streamer reconnects
+        if getattr(self.client, 'browser_streamer', None):
+            self.client.browser_streamer.on_reconnect_callback = self._handle_browser_reconnect
+
+    def _handle_browser_reconnect(self):
+        """Called automatically when browser streamer reconnects after a stalled datafeed."""
+        logger.info("🔄 [RECONNECT HANDLER] Re-seeding M5 completed candle history via REST...")
+        # 1. Enforce a 3.0-second execution cooldown buffer to prevent false spike triggers on initial reconnect ticks
+        self.exec_engine.cooldown_until = time.time() + 3.0
+        try:
+            df_hist = self.client.get_historical_candles(lookback_period='2D')
+            if not df_hist.empty:
+                self.builder.seed_from_history(df_hist)
+                self.signals.history_ready.emit(self.builder.get_all_candles())
+                logger.info(f"✅ [RECONNECT HANDLER] Seeded {len(df_hist)} completed candles across reconnection gap. (3.0s execution buffer active)")
+        except Exception as e:
+            logger.warning(f"⚠️ [RECONNECT HANDLER] Could not re-seed history: {e}")
 
     def stop(self):
         self._running = False
@@ -499,9 +552,9 @@ class BotWorker(QThread):
                 if forming:
                     self.signals.forming_updated.emit(forming)
 
-                # 3. Position Management (Live & Simulation)
+                # 3. Position Management (Live & Simulation with Dual Bid/Ask Pricing)
                 self.exec_engine.manage_open_positions(bid)
-                outcomes = self.exec_engine.update_simulated_positions(bid)
+                outcomes = self.exec_engine.update_simulated_positions(bid, ask)
                 for out in outcomes:
                     self.signals.trade_outcome.emit(out)
 
@@ -516,39 +569,99 @@ class BotWorker(QThread):
                         instant_tvel = self.builder.get_instant_tick_velocity(5.0)
                         eff_pvel = max(self.builder.get_price_velocity(), abs(instant_pvel * 60.0))
                         eff_tvel = max(self.builder.get_tick_velocity(), instant_tvel * 60.0)
+                        trend_side = 'buy' if (forming and forming['c'] >= forming['o']) else 'sell'
+                        measured_noise = self.builder.get_realtime_noise_variance(60.0, trend_side=trend_side)
 
-                        snap = self.engine.analyse(
-                            completed_candles=completed,
-                            forming_candle=forming,
-                            tick_velocity=eff_tvel,
-                            price_velocity=eff_pvel,
-                            current_price=bid,
+                        # ── Multi-Timeframe Analysis & Live HUD Telemetry ──
+                        c_m5_ts = int(forming['t'] // 1000) if forming else int(completed[-1]['t'] // 1000)
+                        forming_m1 = self.builder.get_forming_m1_candle() or forming
+                        recent_1s = self.builder.get_recent_tick_flow(20)
+                        cur_1s_sec = {'c': bid, 'h': ask, 'l': bid, 'v': max(1, int(eff_tvel / 60.0))}
+                        elapsed_s = int(time.time()) % 60
+
+                        # 1. Evaluate Multi-TF Signal & Build Real-Time HUD Snapshot
+                        sig = self.engine.evaluate_signal(
+                            m5_candles=completed,
+                            m1_candle=forming_m1,
+                            current_tick_sec=cur_1s_sec,
+                            elapsed_sec_in_m1=elapsed_s,
                             spread=spread,
-                            recent_ticks=self.builder.get_recent_tick_flow(5),
-                            orderflow_delta=self.builder.get_cumulative_tick_delta(10.0),
+                            recent_1s_bars=recent_1s
+                        )
+                        
+                        snap = self.engine.build_telemetry_snapshot(
+                            m5_candles=completed,
+                            m1_candle=forming_m1,
+                            current_price=bid,
+                            tick_vel=eff_tvel,
+                            price_vel=eff_pvel,
+                            sig=sig
                         )
                         self.signals.snapshot_ready.emit(snap)
+                        
+                        # ── Atomic Tick Telemetry Logging ──
+                        try:
+                            self.telemetry_logger.log_tick(
+                                bid=bid,
+                                ask=ask,
+                                spread=spread,
+                                eff_tvel=eff_tvel,
+                                eff_pvel=eff_pvel,
+                                m5_candles=completed,
+                                m1_candle=forming_m1,
+                                sig=sig,
+                                snap=snap,
+                                broker_state={
+                                    'active_positions': len(self.exec_engine.virtual_broker.positions),
+                                    'used_margin': self.exec_engine.virtual_broker.used_margin,
+                                    'balance': self.exec_engine.virtual_broker.balance
+                                }
+                            )
+                        except Exception as e:
+                            pass
 
-                        if self.exec_engine.has_active_trade:
-                            # Forward active position to UI
-                            active_sim = self.exec_engine.active_simulations[0]['setup']
-                            self.signals.simulation_updated.emit(active_sim)
-                        else:
-                            c_time = int(forming['t'] // 1000) if forming else int(completed[-1]['t'] // 1000)
-                            setup = self.exec_engine.calculate_trade_setup(snap, bid, candle_time=c_time)
-                            self.signals.simulation_updated.emit(setup)
+                        # 2. Update Card 4 (Quant Multi-Track Sizing Standby Deck)
+                        rolling_20s_cnt = self.builder.get_ticks_in_window(20.0)
+                        is_high_burst = (rolling_20s_cnt >= 25)
+                        sim_deck_state = {
+                            'status': 'active',
+                            'ready_to_simulate': sig.is_valid,
+                            'track_a': {'total_lots': 0.10, 'tp_dist': 2.00, 'simulation_passed': (sig.is_valid and is_high_burst)},
+                            'track_b': {'total_lots': 0.03, 'tp_dist': 3.33, 'simulation_passed': (sig.is_valid and not is_high_burst)},
+                            'track_c_buy': {'total_lots': 0.03, 'tp_dist': 3.33, 'simulation_passed': (sig.is_valid and not is_high_burst)},
+                        }
+                        self.signals.simulation_updated.emit(sim_deck_state)
 
-                            if setup and setup.get('ready_to_simulate', False):
-                                self.exec_engine.register_simulation(setup)
-                                if config.ENABLE_DEMO_EXECUTION:
-                                    self.exec_engine.execute_setup(setup)
+                        # 3. Process Execution via Multi-TF Trade Coordinator
+                        coord_res = self.coordinator.on_tick(
+                            bid=bid,
+                            ask=ask,
+                            m5_candles=completed,
+                            m1_candle=forming_m1,
+                            current_sec=cur_1s_sec,
+                            elapsed_sec_in_m1=elapsed_s,
+                            current_m5_ts=c_m5_ts,
+                            preferred_track=None,
+                            recent_1s_bars=recent_1s,
+                            eff_tvel=eff_tvel,
+                            rolling_20s_ticks=rolling_20s_cnt
+                        )
+                        if coord_res:
+                            if isinstance(coord_res, dict):
+                                # 1. Render all active executed track boxes on the chart
+                                for r in coord_res.get('executed', []):
+                                    self.signals.simulation_updated.emit(r)
+                                # 2. Update chart outcome boxes (Green TP / Blue BE / Red SL)
+                                for c in coord_res.get('closed', []):
+                                    self.signals.trade_outcome.emit(c)
+                            else:
+                                self.signals.simulation_updated.emit(coord_res)
 
                         tf = int(completed[0]['t'] // 1000)
-                        tt = int(completed[-1]['t'] // 1000) + 7200
-                        self.signals.structure_updated.emit(
-                            snap.structure.nearest_resistance,
-                            snap.structure.nearest_support,
-                            tf, tt)
+                        tt = int(completed[-1]['t'] // 1000)
+                        nearest_res = snap.structure.nearest_resistance
+                        nearest_sup = snap.structure.nearest_support
+                        self.signals.structure_updated.emit(nearest_res, nearest_sup, tf, tt)
 
             except Exception as e:
                 self.signals.error_occurred.emit(str(e)[:80])
@@ -556,7 +669,6 @@ class BotWorker(QThread):
                 continue
 
             elapsed = time.time() - t0
-            # Calibrated 250ms pacing (~3.5-4 ticks/sec, 100% safe from Cloudflare Error 1015)
             sleep_s = max(0.10, (config.POLL_INTERVAL_MS / 1000.0) - elapsed)
             time.sleep(sleep_s)
 
@@ -576,6 +688,8 @@ class AppController(QObject):
         self.signals    = BotSignals()
         self.window     = None
         self.bot_worker = None
+        self.telemetry_poller = None
+        self.mobile_web = None
 
         self.boot = BootWorker()
         self.boot.status.connect(self._on_boot_status)
@@ -590,9 +704,16 @@ class AppController(QObject):
     def _on_boot_progress(self, n: int, total: int):
         self.splash.set_progress(n, total)
 
-    def _on_boot_done(self, client, builder, engine, exec_engine):
-        self.window = MainChartWindow(self.signals)
+    def _on_boot_done(self, client, builder, engine, exec_engine, coordinator, acc_mgr, telemetry_poller, mobile_web):
+        self.client = client
+        self.telemetry_poller = telemetry_poller
+        self.mobile_web = mobile_web
+        self.window = MainChartWindow(self.signals, account_manager=acc_mgr)
         self.window.show()
+
+        # Connect background telemetry poller to UI dashboard
+        if self.telemetry_poller:
+            self.telemetry_poller.signals.telemetry_updated.connect(self.window.dashboard_tab.on_telemetry_updated)
 
         all_candles = builder.get_all_candles()
         completed   = [c for c in all_candles if c is not builder.forming_candle]
@@ -601,7 +722,7 @@ class AppController(QObject):
 
         QTimer.singleShot(600, self.splash.close)
 
-        self.bot_worker = BotWorker(client, builder, engine, exec_engine, self.signals)
+        self.bot_worker = BotWorker(client, builder, engine, exec_engine, coordinator, self.signals)
         self.bot_worker.start()
 
         self.app.aboutToQuit.connect(self._shutdown)
@@ -611,9 +732,15 @@ class AppController(QObject):
         self.splash.add_status("    Check credentials or network connection.", False)
 
     def _shutdown(self):
+        if hasattr(self, 'client') and self.client and hasattr(self.client, 'browser_streamer') and self.client.browser_streamer:
+            self.client.browser_streamer.stop()
+        if self.mobile_web:
+            self.mobile_web.stop()
+        if self.telemetry_poller:
+            self.telemetry_poller.stop()
         if self.bot_worker:
             self.bot_worker.stop()
-            self.bot_worker.wait(2000)
+            self.bot_worker.wait(1500)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

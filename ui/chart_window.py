@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QFrame, QSizePolicy
+    QLabel, QFrame, QSizePolicy, QStackedWidget, QPushButton
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineSettings
@@ -18,6 +18,8 @@ from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from ui.dashboard_tab import DashboardTab
+from core.multi_account_manager import MultiAccountManager
 
 _UI_DIR = Path(__file__).parent
 _LW_JS  = _UI_DIR / "lw-charts.js"
@@ -124,7 +126,8 @@ const supportLine = chart.addLineSeries({{
 
 let historicalSetups = [];
 let hasFitted = false;
-let activeSimSetup = null;
+let hasHistoryLoaded = false;
+let activeSimSetups = {{}};
 let lastCandleTime = null;
 
 function renderOverlay() {{
@@ -139,38 +142,63 @@ function renderOverlay() {{
     drawBox(s, false);
   }}
 
-  // Render current active trigger setup if exists
-  if (activeSimSetup && activeSimSetup.ready_to_simulate) {{
-    drawBox(activeSimSetup, true);
+  // Render current active trigger setups (e.g. Track B + Track C simultaneously)
+  for (const key in activeSimSetups) {{
+    const s = activeSimSetups[key];
+    if (s && (s.ready_to_simulate || s.entry_price)) {{
+      drawBox(s, true);
+    }}
   }}
 
   ctx.restore();
 }}
 
+function safeTimeToCoord(t) {{
+  try {{
+    if (t === null || t === undefined || isNaN(t)) return null;
+    const c = chart.timeScale().timeToCoordinate(t);
+    return (c !== undefined && c !== null && !isNaN(c)) ? c : null;
+  }} catch(e) {{
+    return null;
+  }}
+}}
+
+function safePriceToCoord(p) {{
+  try {{
+    if (p === null || p === undefined || isNaN(p)) return null;
+    const c = candleSeries.priceToCoordinate(p);
+    return (c !== undefined && c !== null && !isNaN(c)) ? c : null;
+  }} catch(e) {{
+    return null;
+  }}
+}}
+
 function drawBox(s, isActive) {{
+  if (!s || typeof s.entry_price !== 'number' || typeof s.tp_price !== 'number' || typeof s.sl_price !== 'number') return;
   const cTime = s.candle_time || lastCandleTime;
   if (!cTime) return;
 
-  const yEntry = candleSeries.priceToCoordinate(s.entry_price);
-  const yTP    = candleSeries.priceToCoordinate(s.tp_price);
-  const ySL    = candleSeries.priceToCoordinate(s.sl_price);
-  const xStart = chart.timeScale().timeToCoordinate(cTime);
+  const yEntry = safePriceToCoord(s.entry_price);
+  const yTP    = safePriceToCoord(s.tp_price);
+  const ySL    = safePriceToCoord(s.sl_price);
+  const xStart = safeTimeToCoord(cTime);
 
   if (yEntry === null || yTP === null || ySL === null || xStart === null) return;
   if (xStart < -350 || xStart > container.clientWidth + 50) return; // Offscreen
 
-  // Dynamic candle width calculation that scales with zoom:
-  // Measure exact pixel span of this single M5 candle (300 seconds)
-  const xNext = chart.timeScale().timeToCoordinate(cTime + 300);
-  let singleCandleWidth = (xNext !== null && xNext > xStart) ? (xNext - xStart) : 24;
+  // Safe bar width calculation using chart bar spacing options
+  let barSpacing = 12;
+  try {{
+    const opt = chart.timeScale().options();
+    if (opt && opt.barSpacing) barSpacing = opt.barSpacing;
+  }} catch(e) {{}}
 
-  let width;
-  if (isActive && lastCandleTime && lastCandleTime >= cTime) {{
-    const xLive = chart.timeScale().timeToCoordinate(lastCandleTime + 300);
-    width = (xLive !== null && xLive > xStart) ? Math.max(singleCandleWidth, xLive - xStart) : singleCandleWidth * 2;
-  }} else {{
-    // Strictly fit the single candle width with clear visibility
-    width = Math.max(16, singleCandleWidth);
+  let width = Math.max(16, Math.floor(barSpacing * 2.2));
+  if (isActive && lastCandleTime && lastCandleTime > cTime) {{
+    const xLive = safeTimeToCoord(lastCandleTime);
+    if (xLive !== null && xLive > xStart) {{
+      width = Math.max(width, Math.floor(xLive - xStart + barSpacing * 1.5));
+    }}
   }}
   const x = xStart;
 
@@ -206,8 +234,13 @@ function drawBox(s, isActive) {{
 
   // 4. Clean Glow Typography
   ctx.font = 'bold 9px Consolas, monospace';
+  const winVal = (typeof s.win_pnl === 'number') ? s.win_pnl : (typeof s.potential_profit === 'number' ? s.potential_profit : 300);
+  const lossVal = (typeof s.potential_risk === 'number') ? s.potential_risk : 10;
+  const tpDist = (typeof s.tp_dist === 'number') ? s.tp_dist : Math.abs(s.tp_price - s.entry_price);
+  const slDist = (typeof s.sl_dist === 'number') ? s.sl_dist : Math.abs(s.entry_price - s.sl_price);
+  const totalLots = (typeof s.total_lots === 'number') ? s.total_lots : 0.10;
+
   if (s.status === 'win') {{
-    const winVal = s.win_pnl !== undefined ? s.win_pnl : (s.potential_profit || 300);
     ctx.fillStyle = '#00f298';
     ctx.fillText(trackLabel + '\u2713 TP HIT (+$' + winVal.toFixed(0) + ')', x + 5, tpTop + 10);
   }} else if (s.status === 'be') {{
@@ -215,16 +248,16 @@ function drawBox(s, isActive) {{
     ctx.fillText(trackLabel + '\u2696 BE EXIT ($0.00)', x + 5, slTop + slHeight - 4);
   }} else if (s.status === 'loss') {{
     ctx.fillStyle = '#ff3b5c';
-    ctx.fillText(trackLabel + '\u2717 SL HIT (-$' + (s.potential_risk || 10).toFixed(0) + ')', x + 5, slTop + slHeight - 4);
+    ctx.fillText(trackLabel + '\u2717 SL HIT (-$' + lossVal.toFixed(0) + ')', x + 5, slTop + slHeight - 4);
   }} else {{
     ctx.fillStyle = '#00f298';
-    ctx.fillText(trackLabel + '+' + (s.tp_dist || 0.25).toFixed(2) + ' (+$' + (s.potential_profit || 300).toFixed(0) + ')', x + 5, tpTop + 10);
+    ctx.fillText(trackLabel + '+' + tpDist.toFixed(2) + ' (+$' + winVal.toFixed(0) + ')', x + 5, tpTop + 10);
     ctx.fillStyle = '#ff3b5c';
-    ctx.fillText('-' + (s.sl_dist || 0.12).toFixed(2) + ' (-$' + (s.potential_risk || 10).toFixed(0) + ')', x + 5, slTop + slHeight - 4);
+    ctx.fillText('-' + slDist.toFixed(2) + ' (-$' + lossVal.toFixed(0) + ')', x + 5, slTop + slHeight - 4);
   }}
 
   ctx.fillStyle = '#00f0ff';
-  ctx.fillText('$' + s.entry_price.toFixed(2) + ' (' + s.total_lots.toFixed(2) + 'L)', x + 5, yEntry - 3);
+  ctx.fillText('$' + s.entry_price.toFixed(2) + ' (' + totalLots.toFixed(2) + 'L)', x + 5, yEntry - 3);
 }}
 
 chart.timeScale().subscribeVisibleTimeRangeChange(() => renderOverlay());
@@ -253,7 +286,7 @@ window.edgeAPI = {{
   setHistory: function(json_str) {{
     try {{
       const raw = JSON.parse(json_str);
-      if (!Array.isArray(raw)) return;
+      if (!Array.isArray(raw) || raw.length === 0) return;
       const formatted = [];
       for (const item of raw) {{
         const fc = _formatCandle(item);
@@ -262,36 +295,57 @@ window.edgeAPI = {{
       if (formatted.length > 0) {{
         candleSeries.setData(formatted);
         lastCandleTime = formatted[formatted.length - 1].time;
+        hasHistoryLoaded = true;
         if (!hasFitted) {{
           chart.timeScale().fitContent();
           hasFitted = true;
         }}
         renderOverlay();
       }}
-    }} catch(e) {{ console.error('setHistory error:', e); }}
+    }} catch(e) {{}}
   }},
   updateForming: function(json_str) {{
     try {{
+      if (!hasHistoryLoaded) return;
       const raw = JSON.parse(json_str);
       const fc = _formatCandle(raw);
-      if (fc) {{
+      if (fc && fc.time && !isNaN(fc.open) && !isNaN(fc.high) && !isNaN(fc.low) && !isNaN(fc.close)) {{
+        if (lastCandleTime && fc.time < lastCandleTime) return;
         candleSeries.update(fc);
         lastCandleTime = fc.time;
         renderOverlay();
       }}
-    }} catch(e) {{ console.error('updateForming error:', e); }}
+    }} catch(e) {{}}
   }},
   setStructure: function(res, sup, t_from, t_to) {{
     try {{
-      const t1 = t_from > 1e11 ? Math.floor(t_from / 1000) : t_from;
-      const t2 = t_to > 1e11 ? Math.floor(t_to / 1000) : t_to;
-      if (res !== null && !isNaN(res)) resistanceLine.setData([{{time:t1,value:res}},{{time:t2,value:res}}]);
-      if (sup !== null && !isNaN(sup)) supportLine.setData([{{time:t1,value:sup}},{{time:t2,value:sup}}]);
+      if (!hasHistoryLoaded || !t_from || !t_to) return;
+      const t1 = t_from > 1e11 ? Math.floor(t_from / 1000) : Number(t_from);
+      const t2 = t_to > 1e11 ? Math.floor(t_to / 1000) : Number(t_to);
+      if (!t1 || !t2 || isNaN(t1) || isNaN(t2) || t1 >= t2) return;
+      const numRes = Number(res);
+      const numSup = Number(sup);
+      if (!isNaN(numRes) && numRes > 0) {{
+        resistanceLine.setData([{{time: t1, value: numRes}}, {{time: t2, value: numRes}}]);
+      }}
+      if (!isNaN(numSup) && numSup > 0) {{
+        supportLine.setData([{{time: t1, value: numSup}}, {{time: t2, value: numSup}}]);
+      }}
     }} catch(e) {{}}
   }},
   setSimulationSetup: function(json_str) {{
     try {{
-      activeSimSetup = json_str ? JSON.parse(json_str) : null;
+      if (!json_str) {{
+        activeSimSetups = {{}};
+      }} else {{
+        const s = JSON.parse(json_str);
+        const tKey = s.track_id || s.track_name || 'main';
+        if (s.ready_to_simulate || s.entry_price) {{
+          activeSimSetups[tKey] = s;
+        }} else {{
+          delete activeSimSetups[tKey];
+        }}
+      }}
       renderOverlay();
     }} catch(e) {{ console.error('setSimulationSetup error:', e); }}
   }},
@@ -301,8 +355,7 @@ window.edgeAPI = {{
       if (!s.candle_time && lastCandleTime) s.candle_time = lastCandleTime;
       s.status = 'open';
       const key = s.candle_time || s.timestamp;
-      // Deduplicate: replace or append
-      const idx = historicalSetups.findIndex(h => (h.candle_time === key || h.timestamp === s.timestamp));
+      const idx = historicalSetups.findIndex(h => ((h.candle_time === key || h.timestamp === s.timestamp) && (h.track_id === s.track_id || h.track_name === s.track_name)));
       if (idx >= 0) {{
         historicalSetups[idx] = s;
       }} else {{
@@ -315,19 +368,31 @@ window.edgeAPI = {{
     try {{
       const out = JSON.parse(json_str);
       const ts = out.setup ? out.setup.timestamp : null;
-      for (const s of historicalSetups) {{
-        if (s.timestamp === ts || (out.setup && s.candle_time === out.setup.candle_time)) {{
-          if (out.outcome === 'WIN_TP' || out.outcome === 'WIN_PROFIT_LOCK') {{
+      const trackId = out.track_id || (out.setup ? out.setup.track_id : null);
+      const trackName = (out.setup && out.setup.track_name) ? out.setup.track_name : (trackId ? 'TRACK ' + trackId : '');
+
+      if (trackId && activeSimSetups[trackId]) delete activeSimSetups[trackId];
+      if (trackName && activeSimSetups[trackName]) delete activeSimSetups[trackName];
+
+      for (let i = historicalSetups.length - 1; i >= 0; i--) {{
+        const s = historicalSetups[i];
+        const matchTrack = !trackId || s.track_id === trackId || (s.track_name && s.track_name.includes(trackId));
+        const matchTime = s.timestamp === ts || (out.setup && s.candle_time === out.setup.candle_time);
+        
+        if (matchTrack && (matchTime || (historicalSetups.length - i <= 3))) {{
+          if (['WIN_TP', 'WIN_PROFIT_LOCK', 'RATCHET_WIN'].includes(out.outcome)) {{
             s.status = 'win';
-            s.winning_track = out.setup.track_name;
+            s.winning_track = trackName || s.track_name;
             s.win_pnl = out.pnl;
-            s.tp_price = out.exit_price || out.setup.tp_price;
-          }} else if (out.outcome === 'BREAKEVEN_EXIT') {{
+            s.tp_price = out.exit_price || (out.setup ? out.setup.tp_price : s.tp_price);
+          }} else if (['BE_PROTECTED', 'BREAKEVEN_EXIT', 'BE'].includes(out.outcome)) {{
             s.status = 'be';
-            s.winning_track = out.setup.track_name;
+            s.winning_track = trackName || s.track_name;
+            s.exit_price = out.exit_price;
           }} else {{
             s.status = 'loss';
-            s.winning_track = out.setup.track_name;
+            s.winning_track = trackName || s.track_name;
+            s.exit_price = out.exit_price;
           }}
           break;
         }}
@@ -403,10 +468,11 @@ class TechHudDeck(QWidget):
 
         # 5. LIVE TELEMETRY & FEED CARD
         c5, l5 = self._create_card("5. TELEMETRY & FEED", TEXT_LABEL)
+        self.badge_source = self._card_badge(l5, "FEED: BROWSER RAM (0-REST)", CYBER_CYAN)
         self.val_price    = self._card_big_price(l5, "$4400.00")
-        self.val_spread   = self._card_metric(l5, "SPREAD", "$0.30", TEXT_VAL_WHITE)
-        self.val_latency  = self._card_metric(l5, "STREAM LATENCY", "125 ms", CYBER_CYAN)
-        self.val_mode     = self._card_metric(l5, "ENGINE MODE", "VISUAL SIMULATION", TL_GREEN)
+        self.val_spread   = self._card_metric(l5, "SPREAD", "$0.08", TEXT_VAL_WHITE)
+        self.val_latency  = self._card_metric(l5, "STREAM LATENCY", "< 0.01 ms", CYBER_CYAN)
+        self.val_mode     = self._card_metric(l5, "FEED SOURCE", "BROWSER STREAM", TL_GREEN)
         main_layout.addWidget(c5, 1)
 
     def _create_card(self, title: str, accent_color: str):
@@ -462,12 +528,18 @@ class TechHudDeck(QWidget):
         layout.addWidget(lbl)
         return lbl
 
-    def update_price(self, bid: float, ask: float, spread: float, latency_ms: float):
+    def update_price(self, bid: float, ask: float, spread: float, latency_ms: float = 0.01, source: str = "BROWSER STREAM"):
         self.val_price.setText(f"${bid:.2f}")
         col = TL_GREEN if spread <= 20 else TL_RED
         self.val_spread.setStyleSheet(f"color:{col};font-size:10px;font-weight:bold;")
         self.val_spread.setText(f"${spread:.2f}")
-        self.val_latency.setText(f"{latency_ms:.0f} ms")
+        lat_text = f"{latency_ms:.2f} ms" if latency_ms >= 0.01 else "< 0.01 ms"
+        self.val_latency.setText(lat_text)
+        if hasattr(self, 'badge_source'):
+            src_clean = "BROWSER RAM (0-REST)" if "browser" in str(source).lower() else str(source).upper()
+            self.badge_source.setText(f"FEED: {src_clean}")
+        if hasattr(self, 'val_mode'):
+            self.val_mode.setText("CHROMIUM WEBGL" if "browser" in str(source).lower() else str(source).upper())
 
     def update_snapshot(self, snap):
         # 1. Sub-Second Speed & Momentum
@@ -612,9 +684,10 @@ class TechHudDeck(QWidget):
 
 # ── Obsidian TradeLocker Main Application Window ─────────────────────────────
 class MainChartWindow(QMainWindow):
-    def __init__(self, signals: BotSignals, parent=None):
+    def __init__(self, signals: BotSignals, account_manager: Optional[MultiAccountManager] = None, parent=None):
         super().__init__(parent)
         self.signals = signals
+        self.account_manager = account_manager or MultiAccountManager()
         self._last_logged_ts = 0
         self.setWindowTitle("EDGE LABS — MK III TradeLocker (OBSIDIAN CYBER)")
         self.resize(1300, 780)
@@ -628,9 +701,9 @@ class MainChartWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # 1. Sleek Top Bar
+        # 1. Sleek Top Bar with Tab Switcher
         top_bar = QFrame()
-        top_bar.setFixedHeight(38)
+        top_bar.setFixedHeight(42)
         top_bar.setStyleSheet(f"background: {PANEL_BG}; border-bottom: 1px solid {CARD_BORDER};")
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(14, 0, 14, 0)
@@ -639,19 +712,40 @@ class MainChartWindow(QMainWindow):
         title.setStyleSheet(f"color: {CYBER_CYAN}; font-size: 11px; font-weight: bold; letter-spacing: 2px;")
         top_layout.addWidget(title)
 
+        top_layout.addSpacing(20)
+
+        # View Switcher Buttons
+        self.btn_view_chart = QPushButton("📈 5-D SCALPING CHART")
+        self.btn_view_chart.setStyleSheet("background: #1e293b; color: #38bdf8; font-weight: bold; padding: 5px 12px; border-radius: 4px; font-size: 11px;")
+        self.btn_view_chart.clicked.connect(self._switch_to_chart)
+        top_layout.addWidget(self.btn_view_chart)
+
+        self.btn_view_dash = QPushButton("🛡️ CONTROL CENTER")
+        self.btn_view_dash.setStyleSheet("background: #0f172a; color: #94a3b8; font-weight: bold; padding: 5px 12px; border-radius: 4px; font-size: 11px;")
+        self.btn_view_dash.clicked.connect(self._switch_to_dashboard)
+        top_layout.addWidget(self.btn_view_dash)
+
         top_layout.addStretch()
 
-        self.lbl_symbol = QLabel("XAUUSD \u2022 M5")
+        self.lbl_symbol = QLabel("XAUUSD • M5")
         self.lbl_symbol.setStyleSheet(f"color: {TL_GREEN}; font-size: 11px; font-weight: bold; letter-spacing: 1px;")
         top_layout.addWidget(self.lbl_symbol)
 
-        self.lbl_conn = QLabel("\u25cf CONNECTED (BLBRY)")
+        self.lbl_conn = QLabel("● CONNECTED")
         self.lbl_conn.setStyleSheet(f"color: {TL_GREEN}; font-size: 10px; font-weight: bold; letter-spacing: 1px;")
         top_layout.addWidget(self.lbl_conn)
 
         layout.addWidget(top_bar)
 
-        # 2. Web Engine Chart with Load Queueing
+        # 2. Stacked Widget (Chart View vs Control Center Dashboard)
+        self.stack = QStackedWidget()
+
+        # Page 0: Chart & HUD Deck
+        chart_page = QWidget()
+        chart_layout = QVBoxLayout(chart_page)
+        chart_layout.setContentsMargins(0, 0, 0, 0)
+        chart_layout.setSpacing(0)
+
         self._page_ready = False
         self._pending_history = None
         self._pending_forming = None
@@ -661,11 +755,18 @@ class MainChartWindow(QMainWindow):
         self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         self.web_view.loadFinished.connect(self._on_web_loaded)
         self.web_view.setHtml(_build_chart_html())
-        layout.addWidget(self.web_view, 1)
+        chart_layout.addWidget(self.web_view, 1)
 
-        # 3. HUD Deck
         self.hud_deck = TechHudDeck()
-        layout.addWidget(self.hud_deck)
+        chart_layout.addWidget(self.hud_deck)
+
+        self.stack.addWidget(chart_page)
+
+        # Page 1: Multi-Account Dashboard Tab
+        self.dashboard_tab = DashboardTab(self.account_manager)
+        self.stack.addWidget(self.dashboard_tab)
+
+        layout.addWidget(self.stack, 1)
 
         # Connect Signals
         self.signals.tick_received.connect(self._on_tick)
@@ -678,6 +779,17 @@ class MainChartWindow(QMainWindow):
         self.signals.history_ready.connect(self._on_history_ready)
         self.signals.status_update.connect(self._on_status)
         self.signals.error_occurred.connect(self._on_error)
+
+    def _switch_to_chart(self):
+        self.stack.setCurrentIndex(0)
+        self.btn_view_chart.setStyleSheet("background: #1e293b; color: #38bdf8; font-weight: bold; padding: 5px 12px; border-radius: 4px; font-size: 11px;")
+        self.btn_view_dash.setStyleSheet("background: #0f172a; color: #94a3b8; font-weight: bold; padding: 5px 12px; border-radius: 4px; font-size: 11px;")
+
+    def _switch_to_dashboard(self):
+        self.stack.setCurrentIndex(1)
+        self.btn_view_chart.setStyleSheet("background: #0f172a; color: #94a3b8; font-weight: bold; padding: 5px 12px; border-radius: 4px; font-size: 11px;")
+        self.btn_view_dash.setStyleSheet("background: #1e293b; color: #38bdf8; font-weight: bold; padding: 5px 12px; border-radius: 4px; font-size: 11px;")
+
 
     def _on_web_loaded(self, ok: bool):
         self._page_ready = True
@@ -705,8 +817,8 @@ class MainChartWindow(QMainWindow):
         except Exception:
             pass
 
-    def update_tick(self, bid: float, ask: float, spread: float, latency_ms: float = 0.0):
-        self.hud_deck.update_price(bid, ask, spread, latency_ms)
+    def update_tick(self, bid: float, ask: float, spread: float, latency_ms: float = 0.01, source: str = "BROWSER STREAM"):
+        self.hud_deck.update_price(bid, ask, spread, latency_ms, source)
 
     def update_forming(self, candle: dict):
         if not self._page_ready:
@@ -719,22 +831,28 @@ class MainChartWindow(QMainWindow):
 
     def update_structure(self, res, sup, t_from: int, t_to: int):
         try:
-            self._js(f"window.edgeAPI.setStructure({res or 'null'}, {sup or 'null'}, {t_from}, {t_to})")
+            self._js(f"if(window.edgeAPI) window.edgeAPI.setStructure({res or 'null'}, {sup or 'null'}, {t_from}, {t_to})")
         except Exception:
             pass
 
     def update_simulation_box(self, setup: Optional[Dict[str, Any]]):
         try:
             if setup:
-                self._js(f"window.edgeAPI.setSimulationSetup({json.dumps(json.dumps(setup))})")
+                self._js(f"if(window.edgeAPI) window.edgeAPI.setSimulationSetup({json.dumps(json.dumps(setup))})")
             else:
-                self._js("window.edgeAPI.setSimulationSetup(null)")
+                self._js("if(window.edgeAPI) window.edgeAPI.setSimulationSetup(null)")
         except Exception:
             pass
 
     @pyqtSlot(dict)
     def _on_tick(self, tick: dict):
-        self.update_tick(tick.get('bid', 0.0), tick.get('ask', 0.0), tick.get('spread', 0.0), tick.get('latency_ms', 0.0))
+        self.update_tick(
+            tick.get('bid', 0.0),
+            tick.get('ask', 0.0),
+            tick.get('spread', 0.0),
+            tick.get('latency_ms', 0.01),
+            tick.get('source', 'BROWSER STREAM')
+        )
 
     @pyqtSlot(dict)
     def _on_forming(self, candle: dict):
@@ -783,8 +901,8 @@ class MainChartWindow(QMainWindow):
                 journal_str += (
                     f"### {t_icon} [{t_name}] {side_badge} Setup Triggered — {t_str}\n"
                     f"- **Entry Price:** `${s['entry_price']:.2f}`\n"
-                    f"- **Take Profit:** `${s['tp_price']:.2f}` (+${s['tp_dist']:.2f} move | **+${s['potential_profit']:,.0f} USD Target**)\n"
-                    f"- **Stop Loss:** `${s['sl_price']:.2f}` (-${s['sl_dist']:.2f} stop | **-${s['potential_risk']:,.0f} USD Risk**)\n"
+                    f"- **Take Profit:** `${s['tp_price']:.2f}` (+${s['tp_dist']:.2f} move | **+${s['potential_profit']:.2f} USD Target**)\n"
+                    f"- **Stop Loss:** `${s['sl_price']:.2f}` (-${s['sl_dist']:.2f} stop | **-${s['potential_risk']:.2f} USD Risk**)\n"
                     f"- **Position Size:** `{s['total_lots']:.2f} Lots` (Split into {len(s.get('chunks', []))} chunks of $\\le 3.00$ lots)\n"
                     f"- **3-Pass Simulation:** `PASSED (3/3 Passes Positive)`\n\n---\n\n"
                 )
@@ -808,19 +926,19 @@ class MainChartWindow(QMainWindow):
     @pyqtSlot(object)
     def _on_simulation_updated(self, setup):
         self.hud_deck.update_simulation(setup)
-        self.update_simulation_box(setup)
-        if setup and setup.get('ready_to_simulate'):
+        if setup and (setup.get('entry_price') or setup.get('ready_to_simulate')):
+            self.update_simulation_box(setup)
             ts = setup.get('timestamp', 0)
-            if ts != self._last_logged_ts:
+            if ts and ts != self._last_logged_ts:
                 self._last_logged_ts = ts
-                self._js(f"window.edgeAPI.recordHistoricalSetup({json.dumps(json.dumps(setup))})")
+                self._js(f"if(window.edgeAPI) window.edgeAPI.recordHistoricalSetup({json.dumps(json.dumps(setup))})")
                 self._log_and_capture_setup(setup)
 
     @pyqtSlot(dict)
     def _on_trade_outcome(self, outcome: dict):
         """Called when a simulated or real trade hits TP or SL."""
         try:
-            self._js(f"window.edgeAPI.updateSetupOutcome({json.dumps(json.dumps(outcome))})")
+            self._js(f"if(window.edgeAPI) window.edgeAPI.updateSetupOutcome({json.dumps(json.dumps(outcome))})")
             self.update_simulation_box(None)
             log_dir = Path(__file__).parent.parent / "logs"
             log_dir.mkdir(exist_ok=True)
@@ -842,19 +960,35 @@ class MainChartWindow(QMainWindow):
                 t_icon = "🟢"
 
             if res == 'WIN_TP':
-                badge = f"🏆 [{t_name}] RESULT: TAKE-PROFIT HIT (WIN +${pnl:,.0f} USD) ✅"
+                badge = f"🏆 [{t_name}] RESULT: TAKE-PROFIT HIT (WIN +${pnl:,.2f} USD) ✅"
             elif res == 'WIN_PROFIT_LOCK':
-                badge = f"💰 [{t_name}] RESULT: PROFIT RATCHET LOCKED (WIN +${pnl:,.0f} USD) 💵"
+                badge = f"💰 [{t_name}] RESULT: PROFIT RATCHET LOCKED (WIN +${pnl:,.2f} USD) 💵"
             elif res == 'BREAKEVEN_EXIT':
-                badge = f"⚖️ [{t_name}] RESULT: BREAKEVEN EXIT ($0.00 PnL — Capital Protected) 🛡️"
+                badge = f"🛡️ [{t_name}] RESULT: BREAKEVEN EXIT ($0.00 PnL — Capital Protected) ⚖️"
             else:
-                badge = f"🛡️ [{t_name}] RESULT: STOP-LOSS HIT (RISK PROTECTED -${abs(pnl):,.0f} USD) 🛑"
+                badge = f"🛑 [{t_name}] RESULT: STOP-LOSS HIT (LOSS -${abs(pnl):,.2f} USD) ❌"
+
+            entry_p = setup.get('entry_price', 0.0)
+            sl_p = setup.get('sl_price', 0.0)
+            tp_p = setup.get('tp_price', 0.0)
+            qty = setup.get('total_lots', 0.03)
+            side = setup.get('side', 'BUY').upper()
+            pot_profit = setup.get('potential_profit', 0.0)
+            pot_risk = setup.get('potential_risk', 0.0)
+            v_bal = outcome.get('virtual_balance', 4775.66)
+            v_buf = outcome.get('buffer_to_floor', 75.66)
 
             outcome_txt = (
                 f"#### {t_icon} {badge}\n"
+                f"- **Trade Side & Volume:** `{side} {qty:.2f} Lots`\n"
+                f"- **Entry Fill Price:** `${entry_p:.2f}`\n"
                 f"- **Exit Price:** `${exit_p:.2f}`\n"
+                f"- **Planned Stop Loss:** `${sl_p:.2f}` (Max Risk: `-${pot_risk:.2f}`)\n"
+                f"- **Planned Take Profit:** `${tp_p:.2f}` (Target: `+${pot_profit:.2f}`)\n"
                 f"- **Trade Duration:** `{dur} seconds`\n"
-                f"- **Net PnL:** `{'+' if pnl >= 0 else ''}${pnl:,.2f} USD`\n"
+                f"- **Realized Net PnL:** `{'+' if pnl >= 0 else ''}${pnl:,.2f} USD`\n"
+                f"- **Virtual Account Balance:** `${v_bal:,.2f} USD`\n"
+                f"- **Floor Cushion Buffer:** `${v_buf:,.2f} USD`\n"
                 f"- **Closed At:** `{t_str}`\n\n---\n\n"
             )
             with open(md_file, "a", encoding="utf-8") as f:

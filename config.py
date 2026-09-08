@@ -63,9 +63,29 @@ HISTORY_RATE_LIMIT = 3         # From API config: 3 req/sec
 TP_DISTANCE = {'fast': (0.20, 0.45), 'medium': (0.35, 0.65), 'slow': (0.50, 0.90)}
 SL_DISTANCE = {'fast': (0.10, 0.20), 'medium': (0.15, 0.25), 'slow': (0.20, 0.35)}
 
-# === EXECUTION TOGGLE ===
-ENABLE_DEMO_EXECUTION = False  # Set True to send real demo orders to HEROFX, False for visual simulation only
+# === EXECUTION TOGGLE & MODE ===
+LIVE_EXECUTION_ENABLED = False  # Set True to execute live orders on TradeLocker across active accounts
+EXECUTION_PROFILE = "PROPFIRM_5K"  # Options: "PROPFIRM_5K", "PERSONAL_FULL", "CUSTOM"
+
+# === DEFAULT PROPFIRM 5K SCALING PRESETS (1:10 Gold Leverage Margin Safe) ===
+DEFAULT_TRACK_A_PROFIT_TARGET = 20.0   # USD target (+20:1 RR on 0.10 Lot)
+DEFAULT_TRACK_A_RISK_LIMIT = 1.0       # USD max loss per trade (-$1.00 stop)
+DEFAULT_TRACK_A_LOTS = 0.10
+
+DEFAULT_TRACK_B_PROFIT_TARGET = 10.0   # USD target (+30:1 RR on 0.03 Lots)
+DEFAULT_TRACK_B_RISK_LIMIT = 0.36      # USD max loss per trade (-$0.36 stop)
+DEFAULT_TRACK_B_LOTS = 0.03
+
+DEFAULT_TRACK_C_PROFIT_TARGET = 10.0   # USD target (+30:1 RR on 0.03 Lots)
+DEFAULT_TRACK_C_RISK_LIMIT = 0.36      # USD max loss per trade (-$0.36 stop)
+DEFAULT_TRACK_C_LOTS = 0.03
+
+# === DAILY DRAWDOWN CIRCUIT BREAKER ===
+DEFAULT_DAILY_MAX_LOSS_PCT = 0.4188     # Halts trading when daily loss touches $20.00 (0.4188% on $4775.66 balance)
+TELEMETRY_POLL_INTERVAL_SEC = 300      # 5 minutes background telemetry interval (anti-Cloudflare jittered)
+WEB_SERVER_PORT = 8899                 # Mobile PWA Control Center Port (Tailscale & Local Web)
 
 # === UI ===
 CHART_CANDLES_VISIBLE = 100    # How many candles visible on chart at once
 UI_UPDATE_INTERVAL_MS = 100    # UI refresh rate
+

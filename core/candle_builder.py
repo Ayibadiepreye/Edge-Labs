@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 class CandleBuilder:
     def __init__(self, max_buffer: int = 500):
         self.candles = deque(maxlen=max_buffer)  # Completed candles
-        self.forming_candle: Optional[dict] = None  # Current forming candle
+        self.forming_candle: Optional[dict] = None  # Current forming M5 candle
+        self.forming_m1_candle: Optional[dict] = None  # Current forming M1 candle
         self.tick_buffer: deque = deque()  # Last 60 seconds of ticks
         self.tick_count_total: int = 0
         self.callbacks: list[Callable] = []  # Called on candle close
@@ -61,9 +62,36 @@ class CandleBuilder:
         minute_floored = (dt.minute // 5) * 5
         boundary_dt = dt.replace(minute=minute_floored, second=0, microsecond=0)
         return int(boundary_dt.timestamp() * 1000)
+
+    @staticmethod
+    def get_m1_boundary(timestamp_seconds: float) -> int:
+        """Returns the M1 boundary timestamp (in ms) for a given time."""
+        dt = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc)
+        boundary_dt = dt.replace(second=0, microsecond=0)
+        return int(boundary_dt.timestamp() * 1000)
+
+    def get_forming_m1_candle(self) -> Optional[dict]:
+        """Returns the current genuine forming M1 candle."""
+        return self.forming_m1_candle
+
+    def get_recent_tick_flow(self, n: int = 20) -> list[dict]:
+        """Returns the last n seconds of 1s tick flow."""
+        if not self.tick_buffer:
+            return []
+        by_sec = {}
+        for t in self.tick_buffer:
+            sec = int(t['ts'])
+            if sec not in by_sec:
+                by_sec[sec] = {'c': t['bid'], 'h': t['ask'], 'l': t['bid'], 'v': 0}
+            by_sec[sec]['h'] = max(by_sec[sec]['h'], t['ask'])
+            by_sec[sec]['l'] = min(by_sec[sec]['l'], t['bid'])
+            by_sec[sec]['c'] = t['bid']
+            by_sec[sec]['v'] += 1
+        sorted_secs = sorted(by_sec.keys())
+        return [by_sec[s] for s in sorted_secs[-n:]]
     
     def on_tick(self, bid: float, ask: float, timestamp: float = None) -> None:
-        """Process a new price tick. Updates forming candle and tick buffer.
+        """Process a new price tick. Updates forming candle, forming M1 candle, and tick buffer.
         
         Args:
             bid: Current bid price
@@ -94,13 +122,32 @@ class CandleBuilder:
             self._close_forming_candle()
             self._start_new_candle(bid, current_m5_boundary)
             
-        # 3. Update forming candle OHLC (using bid price)
+        # 3. Update forming M5 candle OHLC (using bid price)
         self.forming_candle['c'] = bid
         if bid > self.forming_candle['h']:
             self.forming_candle['h'] = bid
         if bid < self.forming_candle['l']:
             self.forming_candle['l'] = bid
         self.forming_candle['v'] += 1
+
+        # 4. Update genuine forming M1 candle
+        current_m1_boundary = self.get_m1_boundary(timestamp)
+        if self.forming_m1_candle is None or current_m1_boundary > self.forming_m1_candle['t']:
+            self.forming_m1_candle = {
+                't': current_m1_boundary,
+                'o': bid,
+                'h': bid,
+                'l': bid,
+                'c': bid,
+                'v': 1
+            }
+        else:
+            self.forming_m1_candle['c'] = bid
+            if bid > self.forming_m1_candle['h']:
+                self.forming_m1_candle['h'] = bid
+            if bid < self.forming_m1_candle['l']:
+                self.forming_m1_candle['l'] = bid
+            self.forming_m1_candle['v'] += 1
     
     def get_all_candles(self) -> list[dict]:
         """Returns all completed candles + forming candle as list of dicts."""
@@ -188,6 +235,13 @@ class CandleBuilder:
             return list(self.tick_buffer)
         return list(self.tick_buffer)[-n:]
 
+    def get_ticks_in_window(self, window_sec: float = 20.0) -> int:
+        """Returns the exact integer count of ticks received in the last window_sec seconds."""
+        if not self.tick_buffer:
+            return 0
+        now = self.tick_buffer[-1]['ts']
+        return sum(1 for t in self.tick_buffer if (now - t['ts']) <= window_sec)
+
     def get_cumulative_tick_delta(self, window_sec: float = 10.0) -> dict:
         """Calculates institutional Orderflow Delta:
         - delta_ratio: Net directional tick volume (+1.0 = 100% buy pressure, -1.0 = 100% sell)
@@ -223,6 +277,62 @@ class CandleBuilder:
             'up_ticks': up_ticks,
             'down_ticks': down_ticks,
             'acceleration': round(accel, 2)
+        }
+
+    def get_realtime_noise_variance(self, window_sec: float = 60.0, trend_side: str = 'buy') -> dict:
+        """Calculates true adverse counter-trend noise:
+        - adverse_distance: Maximum distance price pulled back in the OPPOSING direction of the move.
+        - adverse_velocity: Peak $/sec speed of opposing counter-movement.
+        """
+        if len(self.tick_buffer) < 3:
+            return {'adverse_distance': 0.05, 'adverse_velocity': 0.02}
+
+        now = self.tick_buffer[-1]['ts']
+        recent = [t for t in self.tick_buffer if (now - t['ts']) <= window_sec]
+        if len(recent) < 2:
+            return {'adverse_distance': 0.05, 'adverse_velocity': 0.02}
+
+        max_adverse_dist = 0.0
+        peak_adverse_vel = 0.0
+
+        if trend_side == 'buy':
+            # For BUY: Measure downward counter-pullbacks from running peaks
+            peak_p = recent[0]['bid']
+            for i in range(1, len(recent)):
+                curr_p = recent[i]['bid']
+                if curr_p > peak_p:
+                    peak_p = curr_p
+                else:
+                    dip = peak_p - curr_p
+                    if dip > max_adverse_dist:
+                        max_adverse_dist = dip
+                    dt = max(0.2, recent[i]['ts'] - recent[i-1]['ts'])
+                    diff = recent[i-1]['bid'] - curr_p
+                    if diff > 0:
+                        vel = diff / dt
+                        if vel > peak_adverse_vel:
+                            peak_adverse_vel = vel
+        else:
+            # For SELL: Measure upward counter-bounces from running troughs
+            trough_p = recent[0]['bid']
+            for i in range(1, len(recent)):
+                curr_p = recent[i]['bid']
+                if curr_p < trough_p:
+                    trough_p = curr_p
+                else:
+                    bounce = curr_p - trough_p
+                    if bounce > max_adverse_dist:
+                        max_adverse_dist = bounce
+                    dt = max(0.2, recent[i]['ts'] - recent[i-1]['ts'])
+                    diff = curr_p - recent[i-1]['bid']
+                    if diff > 0:
+                        vel = diff / dt
+                        if vel > peak_adverse_vel:
+                            peak_adverse_vel = vel
+
+        return {
+            'adverse_distance': round(max(0.04, float(max_adverse_dist)), 3),
+            'adverse_velocity': round(float(peak_adverse_vel), 3)
         }
     
     def on_candle_close(self, callback: Callable) -> None:
